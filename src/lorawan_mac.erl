@@ -68,28 +68,23 @@ ingest_join_frame(MAC, Msg, AppEUI, DevEUI, DevNonce, MIC) ->
 ingest_data_frame(_MAC, MType, Msg, FOpts, FRMPayload, MIC,
         #frame{devaddr=DevAddr, fcnt=FCnt, port=Port}=Frame)
         when MType == 2#010; MType == 2#100 ->
-    case accept_node_frame(DevAddr, FCnt) of
-        {ok, Fresh, {Network, Profile, Node}} ->
-            case crypto:cmac(aes_cbc128, Node#node.nwkskey,
-                    <<(b0(MType band 1, DevAddr, Node#node.fcntup, byte_size(Msg)))/binary, Msg/binary>>, 4) of
-                MIC ->
-                    ok = lorawan_admin:write(
-                            ensure_used_fields(Network, Node)),
-                    case Port of
-                        0 when byte_size(FOpts) == 0 ->
-                            Data = cipher(FRMPayload, Node#node.nwkskey, MType band 1, DevAddr, Node#node.fcntup),
-                            {Fresh, {Network, Profile, Node},
-                                Frame#frame{fopts=reverse(Data), data= <<>>}};
-                        0 ->
-                            {error, {node, DevAddr}, double_fopts};
-                        _N ->
-                            Data = cipher(FRMPayload, Node#node.appskey, MType band 1, DevAddr, Node#node.fcntup),
-                            {Fresh, {Network, Profile, Node},
-                                Frame#frame{fopts=FOpts, data=reverse(Data)}}
-                    end;
-                _MIC2 ->
-                    {error, {node, DevAddr}, bad_mic}
-            end;
+    case accept_node_frame(DevAddr, FCnt, MType, Msg, MIC) of
+        {ok, Fresh, {Network, Profile, Node}} when Port /= 0; byte_size(FOpts) == 0 ->
+            % Authentication must complete before resetting queues or counters.
+            case Fresh of reset -> reset_node(DevAddr); _ -> ok end,
+            ok = lorawan_admin:write(ensure_used_fields(Network, Node)),
+            Key = case Port of 0 -> Node#node.nwkskey; _ -> Node#node.appskey end,
+            Data = reverse(cipher(FRMPayload, Key, MType band 1, DevAddr, Node#node.fcntup)),
+            Decoded = case Port of
+                0 -> Frame#frame{fcnt=Node#node.fcntup, fopts=Data, data= <<>>};
+                _ -> Frame#frame{fcnt=Node#node.fcntup, fopts=FOpts, data=Data}
+            end,
+            Kind = case Fresh of reset -> uplink; _ -> Fresh end,
+            {Kind, {Network, Profile, Node}, Decoded};
+        {ok, _, _} ->
+            {error, {node, DevAddr}, double_fopts};
+        {error, bad_mic} ->
+            {error, {node, DevAddr}, bad_mic};
         {error, ignored_node} ->
             {ignore, Frame};
         {error, Error, Args} ->
@@ -175,23 +170,82 @@ reset_node(DevAddr) ->
     lorawan_db_guard:purge_queued(DevAddr).
 
 
-accept_node_frame(DevAddr, FCnt) ->
+accept_node_frame(DevAddr, FCnt, MType, Msg, MIC) ->
     case is_ignored(DevAddr, mnesia:dirty_all_keys(ignored_node)) of
         false ->
             case load_node(DevAddr) of
                 {ok, {Network, Profile, Node}} ->
-                    case check_fcnt({Network, Profile, Node}, FCnt) of
-                        {ok, Fresh, Node2} ->
-                            {ok, Fresh, {Network, Profile, Node2}};
-                        Error ->
-                            Error
-                    end;
+                    authenticate_node_frame({Network, Profile, Node}, FCnt, MType, Msg, MIC);
                 Error ->
                     Error
             end;
         true ->
             {error, ignored_node}
     end.
+
+% Try the normal counter first. Recovery is bounded and never lowers the stored
+% counter; an explicitly configured reset policy is handled by check_fcnt/2.
+authenticate_node_frame({Network, Profile, Node}=Context, FCnt, MType, Msg, MIC) ->
+    case check_fcnt(Context, FCnt) of
+        {ok, Fresh, Candidate} ->
+            case valid_mic(Candidate, MType, Msg, MIC) of
+                true ->
+                    report_counter_gap(Node, Candidate, Fresh),
+                    {ok, Fresh, {Network, Profile, Candidate}};
+                false ->
+                    lager:debug("~s MIC mismatch: stored FCntUp ~p, received low ~B, candidate ~B",
+                        [binary_to_hex(Node#node.devaddr), Node#node.fcntup, FCnt, Candidate#node.fcntup]),
+                    recover_counter(Context, FCnt, MType, Msg, MIC, {error, bad_mic})
+            end;
+        Error -> recover_counter(Context, FCnt, MType, Msg, MIC, Error)
+    end.
+
+valid_mic(#node{devaddr=DevAddr, nwkskey=Key, fcntup=FCnt}, MType, Msg, MIC)
+        when is_integer(FCnt), FCnt >= 0, FCnt =< 16#FFFFFFFF ->
+    crypto:cmac(aes_cbc128, Key,
+        <<(b0(MType band 1, DevAddr, FCnt, byte_size(Msg)))/binary, Msg/binary>>, 4) == MIC;
+valid_mic(_Node, _MType, _Msg, _MIC) ->
+    false.
+
+recover_counter({Network, Profile, Node}, Low, MType, Msg, MIC, Error) ->
+    Attempts = application:get_env(lorawan_server, fcnt_recovery_attempts, 100),
+    case find_counter(Node, Low, MType, Msg, MIC, 0, Attempts) of
+        {ok, Candidate} ->
+            Fresh = case Candidate#node.fcntup == Node#node.fcntup of
+                true -> retransmit;
+                false -> uplink
+            end,
+            lager:info("~s recovered FCntUp ~p -> ~B", [binary_to_hex(Node#node.devaddr),
+                Node#node.fcntup, Candidate#node.fcntup]),
+            report_counter_gap(Node, Candidate, Fresh),
+            {ok, Fresh, {Network, Profile, Candidate}};
+        not_found -> Error
+    end.
+
+find_counter(Node, Low, MType, Msg, MIC, High, Attempts)
+        when is_integer(Attempts), Attempts >= 0, Attempts =< 65536, High < Attempts ->
+    FCnt = (High bsl 16) bor Low,
+    Candidate = Node#node{fcntup=FCnt},
+    case (Node#node.fcntup == undefined orelse FCnt >= Node#node.fcntup)
+            andalso valid_mic(Candidate, MType, Msg, MIC) of
+        true -> {ok, Candidate};
+        false -> find_counter(Node, Low, MType, Msg, MIC, High+1, Attempts)
+    end;
+find_counter(_Node, _Low, _MType, _Msg, _MIC, _High, _Attempts) ->
+    not_found.
+
+report_counter_gap(Old, New, uplink) ->
+    Lost = case Old#node.fcntup of
+        undefined -> New#node.fcntup - 1;
+        Last when New#node.fcntup >= Last -> New#node.fcntup - Last - 1;
+        Last -> fcnt16_gap(Last, New#node.fcntup) - 1
+    end,
+    case Lost > 0 of
+        true -> lorawan_utils:throw_warning({node, New#node.devaddr}, {uplinks_missed, Lost});
+        false -> ok
+    end;
+report_counter_gap(_Old, _New, _Fresh) ->
+    ok.
 
 is_ignored(_DevAddr, []) ->
     false;
@@ -280,7 +334,6 @@ check_fcnt({Network, Profile, Node}, FCnt) ->
                     % some device start with 0, some with 1
                     {ok, uplink, Node#node{fcntup = N}};
                 N when N < ?MAX_FCNT_GAP ->
-                    lorawan_utils:throw_warning({node, Node#node.devaddr}, {uplinks_missed, N-1}),
                     {ok, uplink, Node#node{fcntup = N}};
                 _BigN ->
                     {error, {fcnt_gap_too_large, FCnt}, Node#node.last_rx}
@@ -288,9 +341,8 @@ check_fcnt({Network, Profile, Node}, FCnt) ->
         (Profile#profile.fcnt_check == 2 orelse Profile#profile.fcnt_check == 3),
                 FCnt < Node#node.fcntup, FCnt < MaxLost ->
             lager:debug("~s fcnt reset", [binary_to_hex(Node#node.devaddr)]),
-            reset_node(Node#node.devaddr),
             % works for 16b only since we cannot distinguish between reset and 32b rollover
-            {ok, uplink, Node#node{fcntup = FCnt, fcntdown=0,
+            {ok, reset, Node#node{fcntup = FCnt, fcntdown=0,
                 adr_use=initial_adr(Network), adr_failed=[],
                 dcycle_use=Network#network.dcycle_init,
                 rxwin_use=Network#network.rxwin_init, rxwin_failed=[],
@@ -301,16 +353,17 @@ check_fcnt({Network, Profile, Node}, FCnt) ->
         Profile#profile.fcnt_check == 3 ->
             % checks disabled
             {ok, uplink, Node#node{fcntup = FCnt}};
-        FCnt == Node#node.fcntup ->
+        FCnt == Node#node.fcntup;
+                FCnt == (Node#node.fcntup band 16#FFFF),
+                (Profile#profile.fcnt_check == 1 orelse Node#node.fcntup > 16#FFFF) ->
             % retransmission
             {ok, retransmit, Node};
-        Profile#profile.fcnt_check == 1 ->
+        Profile#profile.fcnt_check == 1; Node#node.fcntup > 16#FFFF ->
             % strict 32-bit
             case fcnt32_gap(Node#node.fcntup, FCnt) of
                 1 ->
                     {ok, uplink, Node#node{fcntup = fcnt32_inc(Node#node.fcntup, 1)}};
                 N when N < ?MAX_FCNT_GAP ->
-                    lorawan_utils:throw_warning({node, Node#node.devaddr}, {uplinks_missed, N-1}),
                     {ok, uplink, Node#node{fcntup = fcnt32_inc(Node#node.fcntup, N)}};
                 _BigN ->
                     {error, {fcnt_gap_too_large, FCnt}, Node#node.last_rx}
@@ -321,7 +374,6 @@ check_fcnt({Network, Profile, Node}, FCnt) ->
                 1 ->
                     {ok, uplink, Node#node{fcntup = FCnt}};
                 N when N < ?MAX_FCNT_GAP ->
-                    lorawan_utils:throw_warning({node, Node#node.devaddr}, {uplinks_missed, N-1}),
                     {ok, uplink, Node#node{fcntup = FCnt}};
                 _BigN ->
                     {error, {fcnt_gap_too_large, FCnt}, Node#node.last_rx}
@@ -331,7 +383,7 @@ check_fcnt({Network, Profile, Node}, FCnt) ->
 fcnt16_gap(A, B) ->
     if
         A =< B -> B - A;
-        A > B -> 16#FFFF - A + B
+        A > B -> 16#10000 - A + B
     end.
 
 fcnt32_gap(A, B) ->
@@ -343,7 +395,7 @@ fcnt32_gap(A, B) ->
 
 fcnt32_inc(FCntUp, N) ->
     % L#node.fcntup is 32b, but the received FCnt may be 16b only
-    (FCntUp + N) band 16#FFFFFFFF.
+    FCntUp + N.
 
 ensure_used_fields(Network, Node) ->
     ensure_adr(Network,

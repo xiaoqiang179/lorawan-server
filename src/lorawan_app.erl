@@ -14,6 +14,11 @@ start() ->
 
 start(_Type, _Args) ->
     ok = ensure_erlang_version(21),
+    Attempts = application:get_env(lorawan_server, fcnt_recovery_attempts, 100),
+    case is_integer(Attempts) andalso Attempts >= 0 andalso Attempts =< 65536 of
+        true -> ok;
+        false -> error({invalid_configuration, fcnt_recovery_attempts, Attempts})
+    end,
     lager:debug("Using config: ~p", [application:get_all_env(lorawan_server)]),
     lorawan_db:ensure_tables(),
     case {application:get_env(lorawan_server, http_admin_listen, []), retrieve_valid_ssl()} of

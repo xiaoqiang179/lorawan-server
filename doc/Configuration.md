@@ -52,6 +52,31 @@ To disable the plain HTTP web-admin, set `{http_admin_listen, []}`.
 To enable Prometheus statistics metrics export at `/metrics` URL endpoint, set
 `{enable_prometheus, true}`.
 
+### Uplink frame counter recovery
+
+`{fcnt_recovery_attempts, 100}` controls the number of high 16-bit values tried
+when normal FCnt validation or MIC verification fails. The default tries high
+values **0 through 99**, covering full counters 0 through 6,553,599. Set `0` to
+disable recovery. Valid values are integers from 0 through 65,536; invalid values
+prevent startup. The normal counter is always verified first, even outside the
+recovery range.
+
+Each candidate combines the received low 16 bits with a trial high value. Only a
+candidate with a valid MIC and a counter no lower than the stored FCntUp is
+accepted. Its full counter is used for both decryption and persistence. No match
+means the frame is discarded without updating the node or clearing its queues.
+Recovery can accept a forward jump beyond the normal FCnt gap limit. It does not
+reset FCntDown. Once a 32-bit counter has been recovered, strict profiles retain
+its high bits for subsequent frames and recognize retransmissions correctly.
+Existing explicit **Reset on zero** and **Disabled** policies still apply to
+normally authenticated frames; recovery itself never rolls back a counter.
+
+The search runs only after normal validation fails and costs at most the configured
+number of additional MIC calculations per frame. Keep the limit appropriate for
+your devices. This setting does not recover missing session keys or make a device
+counter reset equivalent to a new session. Update the release's `sys.config` and
+restart the server for configuration changes to take effect.
+
 ### lager section
 
 The [lager](https://github.com/erlang-lager/lager#internal-log-rotation) system

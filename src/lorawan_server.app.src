@@ -36,6 +36,7 @@
         % by default: 5 days or 4*24 frames
         {devstat_gap, {432000, 96}},
         {max_lost_after_reset, 10},
+        {fcnt_recovery_attempts, 100},
         % packet_forwarder's push_timeout_ms + network delay
         {gateway_delay, 200},
         {deduplication_delay, 200},
