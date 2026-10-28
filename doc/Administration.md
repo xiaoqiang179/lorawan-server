@@ -22,7 +22,10 @@ the REST API described below.
 ![alt tag](https://raw.githubusercontent.com/gotthardp/lorawan-server/master/doc/images/admin-dashboard.png)
 
 The server Dashboard shows:
- * Rolling timeline that displays:
+ * Timeline loaded with the **Load timeline** button. It refreshes after each
+   completed request and stops when hidden. Each response includes up to 500
+   latest events and 500 latest frames in the selected range; a notice appears
+   when more records match. Narrow the range for more detail. It displays:
    - **red** error [events](Events.md#events);
    - **yellow** warning [events](Events.md#events);
    - **blue** handled uplinks frames;

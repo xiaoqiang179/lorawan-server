@@ -43,6 +43,14 @@ content_types_provided(Req, State) ->
 get_timeline(Req, State) ->
     #{'start' := Start, 'end' := End} =
         cowboy_req:match_qs([{'start', [], <<>>}, {'end', [], <<>>}], Req),
+    {EventCount, EventRecords} = lorawan_admin_query:top(event,
+        [{#event{evid='$1', first_rx='$2', last_rx='$3', _='_'},
+            select_datetime(Start, End, '$2', '$3'), ['$_']}],
+        #event.last_rx, desc, 500),
+    {FrameCount, FrameRecords} = lorawan_admin_query:top(rxframe,
+        [{#rxframe{datetime='$1', _='_'},
+            select_datetime(Start, End, '$1', '$1'), ['$_']}],
+        #rxframe.datetime, desc, 500),
     Events = lists:map(
         fun (#event{evid=Id, first_rx=Time, last_rx=Time, severity=Severity, text=Text}=Event) ->
                 [{id, lorawan_utils:binary_to_hex(Id)},
@@ -58,8 +66,7 @@ get_timeline(Req, State) ->
                     {start, StartTime},
                     {'end', EndTime}]
         end,
-        mnesia:dirty_select(event, [{#event{evid='$1', first_rx='$2', last_rx='$3', _='_'},
-            select_datetime(Start, End, '$2', '$3'), ['$_']}])),
+        EventRecords),
     RxFrames = lists:map(
         fun(#rxframe{frid=Id, dir=Dir, devaddr=DevAddr, datetime=DateTime, port=Port, data=Data}) ->
             [{id, lorawan_utils:binary_to_hex(Id)},
@@ -71,9 +78,11 @@ get_timeline(Req, State) ->
                 {content, addr_port(DevAddr, Port)},
                 {start, DateTime}]
         end,
-        mnesia:dirty_select(rxframe, [{#rxframe{datetime='$1', _='_'},
-            select_datetime(Start, End, '$1', '$1'), ['$_']}])),
-    {jsx:encode([{items, Events++RxFrames}]), Req, State}.
+        FrameRecords),
+    Req2 = cowboy_req:set_resp_header(<<"cache-control">>, <<"no-store">>, Req),
+    {jsx:encode([{items, Events++RxFrames},
+        {truncated, EventCount > 500 orelse FrameCount > 500},
+        {total, EventCount + FrameCount}]), Req2, State}.
 
 addr_port(DevAddr, undefined) ->
     lorawan_utils:binary_to_hex(DevAddr);

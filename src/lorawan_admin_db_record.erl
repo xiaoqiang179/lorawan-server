@@ -63,12 +63,51 @@ content_types_provided(Req, State) ->
 
 handle_get(Req, #state{key=undefined}=State) ->
     Req2 = cowboy_req:set_resp_header(<<"cache-control">>, <<"no-store">>, Req),
-    paginate(Req2, State,
-        sort(Req2, read_records(Req2, State)));
+    case bounded_page(Req2, State) of
+        fallback -> paginate(Req2, State, sort(Req2, read_records(Req2, State)));
+        Result -> Result
+    end;
 handle_get(Req, #state{table=Table, key=Key}=State) ->
     Req2 = cowboy_req:set_resp_header(<<"cache-control">>, <<"no-store">>, Req),
     [Rec] = mnesia:dirty_read(Table, Key),
     {jsx:encode(build_record(Rec, State)), Req2, State}.
+
+% Optimize the dashboard's scalar sorts without changing custom/nested sorts.
+% Keep memory bounded for ordinary pages; exports retain the existing path.
+bounded_page(Req, #state{table=Table, fields=Fields, module=lorawan_admin,
+        auth_fields={ReadFields, _}}=State) ->
+    QS = cowboy_req:match_qs([{'_page', [], <<"1">>},
+        {'_perPage', [], undefined}, {'_sortField', [], undefined},
+        {'_sortDir', [], <<"ASC">>}], Req),
+    #{'_page' := Page0, '_perPage' := PerPage0,
+        '_sortField' := Field0, '_sortDir' := Direction0} = QS,
+    Allowed = [health_decay, last_rx, datetime],
+    case [F || F <- Allowed, atom_to_binary(F, latin1) == Field0,
+            lists:member(F, Fields), lorawan_admin:auth_field(F, ReadFields)] of
+        [Field] when PerPage0 /= undefined ->
+            Page = binary_to_integer(Page0),
+            PerPage = binary_to_integer(PerPage0),
+            Limit = Page * PerPage,
+            case Page > 0 andalso PerPage > 0 andalso Limit =< 1000
+                    andalso (Direction0 == <<"ASC">> orelse Direction0 == <<"DESC">>) of
+                true ->
+                    Direction = case Direction0 of <<"ASC">> -> asc; _ -> desc end,
+                    Filter = lorawan_admin:parse(get_filters(Req)),
+                    Match = list_to_tuple([Table | [maps:get(F, Filter, '_') || F <- Fields]]),
+                    Position = 1 + lorawan_utils:index_of(Field, Fields),
+                    {Count, Records} = lorawan_admin_query:top(Table,
+                        [{Match, [], ['$_']}], Position, Direction, Limit),
+                    Entries = [build_record(R, State) || R <-
+                        lists:sublist(Records, 1 + (Page-1)*PerPage, PerPage)],
+                    Req2 = cowboy_req:set_resp_header(<<"x-total-count">>,
+                        integer_to_binary(Count), Req),
+                    {jsx:encode(Entries), Req2, State};
+                false -> fallback
+            end;
+        _ -> fallback
+    end;
+bounded_page(_Req, _State) ->
+    fallback.
 
 paginate(Req, State, List) ->
     Req2 = cowboy_req:set_resp_header(<<"x-total-count">>, integer_to_binary(length(List)), Req),

@@ -1213,6 +1213,7 @@ myApp.config(['NgAdminConfigurationProvider', function (nga) {
                 nga.field('args', 'wysiwyg')
             ])
             .sortField('last_rx')
+            .sortDir('DESC')
             .perPage(7)
         )
         .addCollection(nga.collection(rxframes).title('Frames')
@@ -1241,6 +1242,7 @@ myApp.config(['NgAdminConfigurationProvider', function (nga) {
                     }),
             ])
             .sortField('datetime')
+            .sortDir('DESC')
             .perPage(7)
         )
     );
@@ -1419,7 +1421,13 @@ function dashboardTemplate(leftPanel, rightPanel) {
 <div class="row dashboard-content">
     <div class="col-lg-12">
         <div class="panel panel-default">
-            <timeline/>
+            <div class="panel-heading">
+                <button type="button" class="btn btn-default btn-sm"
+                    ng-click="timelineVisible = !timelineVisible">
+                    {{timelineVisible ? 'Hide timeline' : 'Load timeline'}}
+                </button>
+            </div>
+            <timeline ng-if="timelineVisible"></timeline>
         </div>
     </div>
 </div>
@@ -1641,12 +1649,17 @@ return {
     template: '<button ng-show="ShowIgnore" ng-click="addIgnored()" type="button" class="btn btn-default btn-xs">ignore</button>'
 };}]);
 
-myApp.directive('timeline', ['$http', '$interval', 'VisDataSet', function($http, $interval, VisDataSet) {
+myApp.directive('timeline', ['$http', '$timeout', '$q', 'VisDataSet', function($http, $timeout, $q, VisDataSet) {
 return {
     restrict: 'E',
     scope: {
     },
     link: function($scope) {
+        var inFlight = false;
+        var destroyed = false;
+        var pendingRange = false;
+        var timer;
+        var cancel = $q.defer();
         $scope.data = {items: VisDataSet([])};
         $scope.options = {
             start: new Date(Date.now() - 600*1000), // 10 minutes ago
@@ -1663,32 +1676,50 @@ return {
                 updateData();
             },
             rangechanged: function(event) {
-                if(event.byUser)
+                if(event.byUser) {
+                    pendingRange = true;
                     updateData();
+                }
             }
         };
 
         function updateData() {
+            if (destroyed || !$scope.timeline || inFlight) return;
+            $timeout.cancel(timer);
+            pendingRange = false;
+            inFlight = true;
             var start = new Date($scope.timeline.range.start);
             var end = new Date($scope.timeline.range.end);
 
-            $http({method: 'GET', url: '/admin/timeline',
+            $http({method: 'GET', url: '/admin/timeline', timeout: cancel.promise,
                     params: {start: start.toISOString(), end: end.toISOString()}})
                 .then(function(response) {
-
-                    var newIds = response.data.items.map(function(a) {return a.id;});
+                    if (destroyed || pendingRange) return;
+                    $scope.error = false;
+                    $scope.truncated = response.data.truncated;
+                    $scope.total = response.data.total;
+                    var newIds = new Set(response.data.items.map(function(a) {return a.id;}));
                     $scope.data.items.getIds().forEach(function(id) {
-                        if(!newIds.includes(id)) $scope.data.items.remove(id);
+                        if(!newIds.has(id)) $scope.data.items.remove(id);
                     });
                     $scope.data.items.update(response.data.items);
+                }, function() {
+                    if (!destroyed) $scope.error = true;
+                }).finally(function() {
+                    inFlight = false;
+                    if (!destroyed) timer = $timeout(updateData, pendingRange ? 0 : 5000);
                 });
         }
-        $scope.stopTime = $interval(updateData, 5000);
         $scope.$on('$destroy', function() {
-            $interval.cancel($scope.stopTime);
+            destroyed = true;
+            $timeout.cancel(timer);
+            cancel.resolve();
         });
     },
-    template: '<vis-timeline data="data" options="options" events="events"></vis-timeline>'
+    template: '<div><p ng-if="truncated" class="alert alert-info">Showing up to 500 latest events and 500 latest frames out of {{total}} matching records. Narrow the time range to see more detail.</p>' +
+        '<p ng-if="error" class="alert alert-warning">Timeline could not be loaded. Retrying shortly.</p>' +
+        '<vis-timeline data="data" options="options" events="events"></vis-timeline></div>'
+
 };}]);
 
 myApp.directive('map', ['leafletData', '$timeout', function (leafletData, $timeout) {
